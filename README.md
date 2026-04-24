@@ -24,7 +24,7 @@ AIVC/
 uv venv .venv
 source .venv/bin/activate
 # 安装 Python 依赖
-uv pip install r apps/frontend/requirements.txt
+uv pip install -r apps/frontend/requirements.txt
 ```
 
 ### 2. 启动服务
