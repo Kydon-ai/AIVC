@@ -10,3 +10,6 @@ build/
 *.egg
 
 .venv/
+.kydon_setting/
+tests/
+docs/实验报告模板.md

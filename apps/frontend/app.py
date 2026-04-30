@@ -16,9 +16,21 @@ current_image = None  # 当前输入图像
 current_quality = 50  # 当前质量因子
 DEBUG_ENABLED = os.getenv("AIVC_DEBUG", "1").strip().lower() not in {"0", "false", "no", "off"}
 BLOCK_SIZE = 8
+BASE_LUMA_QUANT_TABLE = np.array([
+    [16, 11, 10, 16, 24, 40, 51, 61],
+    [12, 12, 14, 19, 26, 58, 60, 55],
+    [14, 13, 16, 24, 40, 57, 69, 56],
+    [14, 17, 22, 29, 51, 87, 80, 62],
+    [18, 22, 37, 56, 68, 109, 103, 77],
+    [24, 35, 55, 64, 81, 104, 113, 92],
+    [49, 64, 78, 87, 103, 121, 120, 101],
+    [72, 92, 95, 98, 112, 100, 103, 99],
+], dtype=np.float32)
 IMAGE_CACHE = {
     "image_signature": None,
+    "img_rgb": None,
     "img_gray": None,
+    "img_cbcr": None,
     "img_padded": None,
     "dct_blocks": None,
     "h": 0,
@@ -29,7 +41,7 @@ IMAGE_CACHE = {
     "sample_dct": None,
 }
 RENDER_CACHE = {"key": None, "result": None}
-RECON_CACHE = {"key": None, "output_img": None, "psnr_text": None}
+RECON_CACHE = {"key": None, "output_img": None, "output_luma": None, "psnr_text": None}
 GRID_CACHE = {"key": None, "grid": None}
 
 
@@ -73,10 +85,35 @@ DCT_MATRIX_T = DCT_MATRIX.T
 DCT_BASES = generate_dct_bases(BLOCK_SIZE)
 
 
-def get_image_signature(img_gray):
-    """根据灰度图生成稳定签名，用于缓存命中判断。"""
-    digest = hashlib.blake2b(img_gray.tobytes(), digest_size=8).hexdigest()
-    return f"{img_gray.shape[0]}x{img_gray.shape[1]}:{digest}"
+def get_image_signature(img_rgb):
+    """根据RGB图生成稳定签名，用于缓存命中判断。"""
+    digest = hashlib.blake2b(img_rgb.tobytes(), digest_size=8).hexdigest()
+    h, w = img_rgb.shape[:2]
+    return f"{h}x{w}:{digest}"
+
+
+def normalize_input_image(input_image):
+    """统一转换为 RGB / Y / CbCr 三个通道表示。"""
+    if isinstance(input_image, np.ndarray):
+        arr = np.asarray(input_image)
+        if arr.dtype != np.uint8:
+            arr = np.clip(arr, 0, 255).astype(np.uint8)
+        if arr.ndim == 2:
+            img_rgb = np.stack([arr] * 3, axis=-1)
+        elif arr.ndim == 3:
+            if arr.shape[2] == 1:
+                img_rgb = np.repeat(arr[:, :, :1], 3, axis=2)
+            else:
+                img_rgb = arr[:, :, :3]
+        else:
+            raise ValueError(f"不支持的图像维度: {arr.shape}")
+    else:
+        img_rgb = np.array(input_image.convert("RGB"), dtype=np.uint8)
+
+    ycbcr = np.array(Image.fromarray(img_rgb, "RGB").convert("YCbCr"), dtype=np.uint8)
+    img_gray = ycbcr[:, :, 0]
+    img_cbcr = ycbcr[:, :, 1:]
+    return img_rgb, img_gray, img_cbcr
 
 
 def build_mask(selected_set):
@@ -89,7 +126,7 @@ def build_mask(selected_set):
     return mask
 
 
-def rebuild_image_cache(img_gray, image_signature):
+def rebuild_image_cache(img_rgb, img_gray, img_cbcr, image_signature):
     """图像变化时重建图像级缓存（整图DCT只做一次）。"""
     h, w = img_gray.shape
     h_pad = (BLOCK_SIZE - h % BLOCK_SIZE) % BLOCK_SIZE
@@ -112,7 +149,9 @@ def rebuild_image_cache(img_gray, image_signature):
 
     IMAGE_CACHE.update({
         "image_signature": image_signature,
+        "img_rgb": img_rgb.copy(),
         "img_gray": img_gray.copy(),
+        "img_cbcr": img_cbcr.copy(),
         "img_padded": img_padded,
         "dct_blocks": dct_blocks,
         "h": h,
@@ -128,25 +167,34 @@ def rebuild_image_cache(img_gray, image_signature):
     RENDER_CACHE["result"] = None
     RECON_CACHE["key"] = None
     RECON_CACHE["output_img"] = None
+    RECON_CACHE["output_luma"] = None
     RECON_CACHE["psnr_text"] = None
 
 
-def ensure_image_cache(img_gray):
+def ensure_image_cache(img_rgb, img_gray, img_cbcr):
     """确保图像级缓存可用，返回(cache_hit, image_signature)。"""
-    image_signature = get_image_signature(img_gray)
+    image_signature = get_image_signature(img_rgb)
     if IMAGE_CACHE["image_signature"] == image_signature:
         return True, image_signature
-    rebuild_image_cache(img_gray, image_signature)
+    rebuild_image_cache(img_rgb, img_gray, img_cbcr, image_signature)
     return False, image_signature
 
 
-def reconstruct_output_img(mask):
-    """使用缓存的整图DCT系数，仅做掩码+IDCT重建。"""
+def reconstruct_output_img(mask, quality_factor):
+    """使用缓存的整图DCT系数，执行掩码+量化+IDCT重建。"""
+    quant_table = get_adjusted_quant_table(quality_factor)
     masked_dct = IMAGE_CACHE["dct_blocks"] * mask
-    reconstructed_blocks = np.matmul(np.matmul(DCT_MATRIX_T, masked_dct), DCT_MATRIX) + 128.0
+    quantized_dct = np.round(masked_dct / quant_table)
+    dequantized_dct = quantized_dct * quant_table
+    reconstructed_blocks = np.matmul(np.matmul(DCT_MATRIX_T, dequantized_dct), DCT_MATRIX) + 128.0
     reconstructed = reconstructed_blocks.transpose(0, 2, 1, 3).reshape(IMAGE_CACHE["h_new"], IMAGE_CACHE["w_new"])
-    reconstructed = np.clip(reconstructed, 0, 255).astype(np.uint8)
-    return reconstructed[:IMAGE_CACHE["h"], :IMAGE_CACHE["w"]]
+    output_luma = np.clip(reconstructed, 0, 255).astype(np.uint8)[:IMAGE_CACHE["h"], :IMAGE_CACHE["w"]]
+
+    output_ycbcr = np.empty((IMAGE_CACHE["h"], IMAGE_CACHE["w"], 3), dtype=np.uint8)
+    output_ycbcr[:, :, 0] = output_luma
+    output_ycbcr[:, :, 1:] = IMAGE_CACHE["img_cbcr"]
+    output_rgb = np.array(Image.fromarray(output_ycbcr, "YCbCr").convert("RGB"), dtype=np.uint8)
+    return output_luma, output_rgb
 
 
 def create_dct_grid(selected_set, size=8):
@@ -204,24 +252,25 @@ def idct_transform(coeffs):
     return np.matmul(np.matmul(DCT_MATRIX_T, coeffs), DCT_MATRIX)
 
 
+def normalize_quality_factor(quality):
+    """将质量因子规范到[1, 100]的整数。"""
+    try:
+        quality_int = int(round(float(quality)))
+    except (TypeError, ValueError):
+        return 50
+    return min(100, max(1, quality_int))
+
+
+def get_adjusted_quant_table(quality):
+    """根据质量因子获取JPEG量化表。"""
+    quality_int = normalize_quality_factor(quality)
+    scale = 50 / quality_int if quality_int < 50 else 2 - quality_int / 50
+    return np.clip(BASE_LUMA_QUANT_TABLE * scale, 1, 255)
+
+
 def quantize(coeffs, quality=50):
     """JPEG量化"""
-    # 标准JPEG亮度量化表
-    quant_table = np.array([
-        [16, 11, 10, 16, 24, 40, 51, 61],
-        [12, 12, 14, 19, 26, 58, 60, 55],
-        [14, 13, 16, 24, 40, 57, 69, 56],
-        [14, 17, 22, 29, 51, 87, 80, 62],
-        [18, 22, 37, 56, 68, 109, 103, 77],
-        [24, 35, 55, 64, 81, 104, 113, 92],
-        [49, 64, 78, 87, 103, 121, 120, 101],
-        [72, 92, 95, 98, 112, 100, 103, 99]
-    ])
-    
-    # 根据质量因子调整量化表
-    scale = 50 / quality if quality < 50 else 2 - quality / 50
-    adjusted_quant = np.clip(quant_table * scale, 1, 255)
-    
+    adjusted_quant = get_adjusted_quant_table(quality)
     quantized = np.round(coeffs / adjusted_quant)
     return quantized, adjusted_quant
 
@@ -240,6 +289,7 @@ def process_image(input_image, selected_bases_str, quality_factor, click_info):
     """处理图像并生成所有输出"""
     global selected_bases
     start_time = time.perf_counter()
+    quality_factor = normalize_quality_factor(quality_factor)
     debug_log(
         f"process_image 开始: quality={quality_factor}, click={click_info}, selected={len(selected_bases)}"
     )
@@ -268,29 +318,14 @@ def process_image(input_image, selected_bases_str, quality_factor, click_info):
         else:
             debug_log(f"DCT网格点击越界，忽略: x={x}, y={y}")
     
-    # 转换图像为灰度
-    if isinstance(input_image, np.ndarray):
-        # [W,H,alpha]或[W,H]两种情况都支持
-        if len(input_image.shape) == 3:
-            # 更标准的灰度像素计算
-            img_gray = (
-                0.299 * input_image[:, :, 0] +
-                0.587 * input_image[:, :, 1] +
-                0.114 * input_image[:, :, 2]
-            ).astype(np.uint8)
-            # img_gray = np.mean(input_image, axis=2).astype(np.uint8)
-        else:
-            img_gray = input_image.astype(np.uint8)
-    else:
-        # 先转为np.array再处理,以兼容不同输入类型
-        img_gray = np.array(input_image.convert('L'))
-    
+    # 统一转换到 RGB + Y/CbCr，DCT作用于Y通道，输出时合成回彩色
+    img_rgb, img_gray, img_cbcr = normalize_input_image(input_image)
     h, w = img_gray.shape
-    debug_log(f"灰度图尺寸: h={h}, w={w}")
+    debug_log(f"输入图像尺寸: h={h}, w={w}, channels=3")
 
     # 图像缓存：仅在图像内容变化时重建整图DCT
     cache_start = time.perf_counter()
-    image_cache_hit, image_signature = ensure_image_cache(img_gray)
+    image_cache_hit, image_signature = ensure_image_cache(img_rgb, img_gray, img_cbcr)
     cache_elapsed = (time.perf_counter() - cache_start) * 1000
     if image_cache_hit:
         debug_log(f"图像缓存命中: 耗时 {cache_elapsed:.1f} ms")
@@ -307,20 +342,23 @@ def process_image(input_image, selected_bases_str, quality_factor, click_info):
 
     # 渲染缓存：完全同状态时，直接返回结果，避免无意义重算
     selected_key = tuple(sorted(selected_bases))
-    render_key = (image_signature, selected_key, int(quality_factor))
+    render_key = (image_signature, selected_key, quality_factor)
     if RENDER_CACHE["key"] == render_key:
         debug_log("渲染缓存命中: 状态未变化，跳过重建")
         return RENDER_CACHE["result"]
+
+    mask = build_mask(selected_bases)
 
     # 创建DCT基选择网格
     grid_start = time.perf_counter()
     dct_grid = create_dct_grid(selected_bases)
     debug_log(f"DCT网格生成完成: 耗时 {(time.perf_counter() - grid_start) * 1000:.1f} ms")
 
-    # 重建缓存：图像和基选择不变时，复用输出图（例如仅调整质量滑条）
-    recon_key = (image_signature, selected_key)
+    # 重建缓存：图像、基选择和质量因子不变时复用输出图
+    recon_key = (image_signature, selected_key, quality_factor)
     if RECON_CACHE["key"] == recon_key:
         output_img = RECON_CACHE["output_img"]
+        output_luma = RECON_CACHE["output_luma"]
         psnr_text = RECON_CACHE["psnr_text"]
         debug_log(
             f"重建缓存命中: selection_changed={selection_changed}, 复用output_img, {psnr_text}"
@@ -331,26 +369,26 @@ def process_image(input_image, selected_bases_str, quality_factor, click_info):
         total_blocks = total_rows * total_cols
         debug_log(
             f"开始块重建: total_blocks={total_blocks}, rows={total_rows}, cols={total_cols}, "
-            "mode=cache_dct+vector_idct"
+            "mode=cache_dct+mask+quantize+vector_idct"
         )
         recon_start = time.perf_counter()
-        mask = build_mask(selected_bases)
-        output_img = reconstruct_output_img(mask)
+        output_luma, output_img = reconstruct_output_img(mask, quality_factor)
         recon_elapsed = (time.perf_counter() - recon_start) * 1000
 
         # 计算PSNR(衡量“重建图像和原图有多接近”的指标,数值越大表示重建图像质量越好)
-        psnr = calculate_psnr(IMAGE_CACHE["img_gray"], output_img)
+        psnr = calculate_psnr(IMAGE_CACHE["img_gray"], output_luma)
         psnr_text = f"PSNR: {psnr:.2f} dB"
         debug_log(f"块重建完成: 耗时 {recon_elapsed:.1f} ms, {psnr_text}")
 
         RECON_CACHE["key"] = recon_key
         RECON_CACHE["output_img"] = output_img
+        RECON_CACHE["output_luma"] = output_luma
         RECON_CACHE["psnr_text"] = psnr_text
 
     # 获取中心区域的8x8块用于显示矩阵（从缓存读取）
     sample_pixels = IMAGE_CACHE["sample_pixels"]
-    dct_coeffs = IMAGE_CACHE["sample_dct"]
-    quantized, quant_table = quantize(dct_coeffs, quality_factor)
+    selected_dct_coeffs = IMAGE_CACHE["sample_dct"] * mask
+    quantized, quant_table = quantize(selected_dct_coeffs, quality_factor)
     
     # 格式化矩阵显示
     def format_matrix(mat, title):
@@ -360,7 +398,7 @@ def process_image(input_image, selected_bases_str, quality_factor, click_info):
         return "\n".join(lines)
     
     input_pixels = format_matrix(sample_pixels, "Input Y Pixel Values")
-    dct_coeffs_str = format_matrix(dct_coeffs, "DCT Coefficients")
+    dct_coeffs_str = format_matrix(selected_dct_coeffs, "Selected DCT Coefficients")
     quantized_str = format_matrix(quantized, "Quantised DCT Coefficients")
     
     # 反量化和逆变换
@@ -369,12 +407,15 @@ def process_image(input_image, selected_bases_str, quality_factor, click_info):
     
     inv_transform = idct_transform(dequantized)
     inv_transform_str = format_matrix(inv_transform, "Inverse Transform Coefficients")
-    
-    output_pixels = format_matrix((inv_transform + 128).astype(int), "Output Y Pixel Values")
+
+    output_pixels = format_matrix(
+        np.clip(inv_transform + 128.0, 0, 255).astype(np.uint8),
+        "Output Y Pixel Values"
+    )
     
     selected_info = f"已选择 {len(selected_bases)}/64 个DCT基"
     result = [
-        IMAGE_CACHE["img_gray"],  # 输入图像
+        IMAGE_CACHE["img_rgb"],  # 输入图像
         dct_grid,  # DCT基选择网格
         output_img,  # 输出图像
         input_pixels,  # 输入像素值
