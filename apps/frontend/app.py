@@ -8,6 +8,7 @@ import numpy as np
 import os
 import time
 import hashlib
+from pathlib import Path
 from PIL import Image
 
 # 全局状态
@@ -43,6 +44,19 @@ IMAGE_CACHE = {
 RENDER_CACHE = {"key": None, "result": None}
 RECON_CACHE = {"key": None, "output_img": None, "output_luma": None, "psnr_text": None}
 GRID_CACHE = {"key": None, "grid": None}
+PRESET_IMAGE_DIR = Path(__file__).resolve().parent / "image"
+SUPPORTED_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".webp"}
+
+
+def list_preset_images():
+    """读取预设图片目录中的可选图片。"""
+    if not PRESET_IMAGE_DIR.exists():
+        return []
+    return [
+        path.name
+        for path in sorted(PRESET_IMAGE_DIR.iterdir())
+        if path.is_file() and path.suffix.lower() in SUPPORTED_IMAGE_EXTS
+    ]
 
 
 def debug_log(message):
@@ -79,9 +93,11 @@ def create_dct_matrix(size=8):
             matrix[u, x] = alpha * np.cos((2 * x + 1) * u * factor)
     return matrix
 
-
+# C矩阵
 DCT_MATRIX = create_dct_matrix(BLOCK_SIZE)
+# C.T
 DCT_MATRIX_T = DCT_MATRIX.T
+# 基函数矩阵，用于可视化交互区域
 DCT_BASES = generate_dct_bases(BLOCK_SIZE)
 
 
@@ -186,6 +202,7 @@ def reconstruct_output_img(mask, quality_factor):
     masked_dct = IMAGE_CACHE["dct_blocks"] * mask
     quantized_dct = np.round(masked_dct / quant_table)
     dequantized_dct = quantized_dct * quant_table
+    
     reconstructed_blocks = np.matmul(np.matmul(DCT_MATRIX_T, dequantized_dct), DCT_MATRIX) + 128.0
     reconstructed = reconstructed_blocks.transpose(0, 2, 1, 3).reshape(IMAGE_CACHE["h_new"], IMAGE_CACHE["w_new"])
     output_luma = np.clip(reconstructed, 0, 255).astype(np.uint8)[:IMAGE_CACHE["h"], :IMAGE_CACHE["w"]]
@@ -467,6 +484,7 @@ custom_css = """
 # 创建Gradio界面
 with gr.Blocks(title="Transform Coding: DCT") as demo:
     gr.Markdown("<div id='title'>Transform Coding: DCT</div>")
+    preset_image_choices = list_preset_images()
     
     # 状态组件存储当前图像
     image_state = gr.State(value=None)
@@ -476,6 +494,13 @@ with gr.Blocks(title="Transform Coding: DCT") as demo:
         # 左侧：输入图像
         with gr.Column(scale=1):
             gr.Markdown("### Input Image")
+            preset_image_selector = gr.Dropdown(
+                choices=preset_image_choices,
+                value=None,
+                label="Preset Images",
+                interactive=True,
+                allow_custom_value=False
+            )
             input_image = gr.Image(label="", type="pil", height=300)
         
         # 中间：DCT基选择
@@ -566,6 +591,23 @@ with gr.Blocks(title="Transform Coding: DCT") as demo:
         current_quality = q
         debug_log(f"事件: handle_quality_change, q={q}")
         return process_image(current_image, "", q, None)[1:]
+
+    def handle_preset_image_change(image_name):
+        if not image_name:
+            return None
+        image_path = PRESET_IMAGE_DIR / image_name
+        if not image_path.exists():
+            debug_log(f"事件: handle_preset_image_change, 文件不存在: {image_path}")
+            return None
+        debug_log(f"事件: handle_preset_image_change, image={image_name}")
+        with Image.open(image_path) as preset_img:
+            return preset_img.convert("RGB").copy()
+
+    def handle_preset_image_load(image_name):
+        preset_img = handle_preset_image_change(image_name)
+        if preset_img is None:
+            return [None] * 11
+        return [preset_img] + process_image(preset_img, "", current_quality, None)[1:]
     
     def handle_dct_click(evt: gr.SelectData):
         """处理DCT网格点击"""
@@ -592,6 +634,18 @@ with gr.Blocks(title="Transform Coding: DCT") as demo:
         inputs=[input_image],
         outputs=[
             dct_grid_display, output_image,
+            input_pixels_display, dct_coeffs_display, quantized_display,
+            dequantized_display, inv_transform_display, output_pixels_display,
+            psnr_display, selected_info
+        ]
+    )
+
+    # 预设图片选择后加载到输入框，再触发 input_image.change 的既有处理逻辑
+    preset_image_selector.change(
+        fn=handle_preset_image_load,
+        inputs=[preset_image_selector],
+        outputs=[
+            input_image, dct_grid_display, output_image,
             input_pixels_display, dct_coeffs_display, quantized_display,
             dequantized_display, inv_transform_display, output_pixels_display,
             psnr_display, selected_info
