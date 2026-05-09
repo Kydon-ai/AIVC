@@ -1,7 +1,5 @@
 # AIVC - Monorepo大单仓项目
 
-使用 Python 构建的全栈 AI 对话系统，采用 Monorepo 架构管理。
-
 ## 📁 项目结构
 
 ```
@@ -10,8 +8,6 @@ AIVC/
 │   └── frontend/        # Gradio 前端界面
 │       ├── app.py       # Gradio 主应用
 │       └── requirements.txt
-├── package.json         # pnpm 工作区配置
-├── pnpm-workspace.yaml
 └── README.md
 ```
 
@@ -53,16 +49,8 @@ PYTHONUNBUFFERED=1 pnpm dev
 
 | 层级 | 技术 | 说明 |
 |------|------|------|
-| 前端 | Gradio 4+（已验证 6.x） | AI 友好的 Web 界面框架 |
-| 架构 | Monorepo | 使用 pnpm workspaces 管理 |
-
-
-## 🎨 功能特性
-
-- **智能对话**: 与后端 AI 服务实时交互
-- **状态监控**: 实时显示后端连接状态
-- **API 测试**: 内置 API 调试工具
-- **响应式界面**: 适配不同屏幕尺寸
+| 前端 | Gradio 4+（已验证 6.x） | 友好的 Web 界面框架 |
+| 架构 | Monorepo | 使用 pnpm workspaces 管理，这个不需要 |
 
 ## 📝 开发说明
 
